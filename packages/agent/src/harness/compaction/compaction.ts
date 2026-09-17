@@ -160,7 +160,12 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	keepRecentTokens: 20000,
 };
 
-/** Calculate total context tokens from provider usage. */
+/** Calculate total context tokens from provider usage.
+ *
+ * 中文注释：
+ * 职责：从 provider 返回的 usage 计算上下文 token 总量。
+ * 优先取 totalTokens；缺失时退化为四项之和（输入+输出+缓存读+缓存写）。
+ */
 export function calculateContextTokens(usage: Usage): number {
 	return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
 }
@@ -211,7 +216,18 @@ function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; in
 	return undefined;
 }
 
-/** Estimate context tokens for messages using provider usage when available. */
+/** Estimate context tokens for messages using provider usage when available.
+ *
+ * 中文注释：
+ * 职责：估算当前消息列表的上下文 token 消耗（压缩决策的输入）。
+ * 核心逻辑：锚定法 —— 从后往前找最后一条"带有效 usage 的 assistant 消息"
+ *   （provider 真实计费值），其 usageTokens 是精确锚点；锚点之后的消息
+ *   （trailingTokens）用 estimateTokens 字符启发式估算；总量 = 锚点 + 尾部。
+ *   没有任何锚点时全部用启发式估算。返回值同时携带锚点下标，
+ *   供压缩算法区分"可信前缀"与"估算尾部"。
+ * 为什么这样设计：provider usage 只反映请求时刻的上下文，其后新增消息
+ *   无法精确计量，混合策略在准确性与实时性间取平衡。
+ */
 export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
 	const usageInfo = getLastAssistantUsageInfo(messages);
 
@@ -242,7 +258,14 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 	};
 }
 
-/** Return whether context usage exceeds the configured compaction threshold. */
+/** Return whether context usage exceeds the configured compaction threshold.
+ *
+ * 中文注释：
+ * 职责：压缩触发判定 —— 上下文是否逼近窗口上限。
+ * 核心逻辑：contextTokens > contextWindow - reserveTokens 时触发。
+ *   reserveTokens（默认 16384）是为"摘要提示词 + 摘要输出"预留的余量，
+ *   保证压缩这个动作本身还有空间可用。压缩未启用时恒返回 false。
+ */
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
 	return contextTokens > contextWindow - settings.reserveTokens;
@@ -266,7 +289,19 @@ function estimateTextAndImageContentChars(content: string | Array<{ type: string
 	return chars;
 }
 
-/** Estimate token count for one message using a conservative character heuristic. */
+/** Estimate token count for one message using a conservative character heuristic.
+ *
+ * 中文注释：
+ * 职责：单条消息的 token 估算（保守字符启发式：字符数 / 4）。
+ * 核心逻辑：按角色分派统计字符 ——
+ *   user：文本长度 + 图片按固定 4800 字符折算；
+ *   assistant：文本 + thinking 推理块 + 工具调用（name + JSON 序列化参数）；
+ *   custom / toolResult：内容块文本 + 图片折算；
+ *   bashExecution：命令 + 输出；
+ *   branchSummary / compactionSummary：摘要文本长度。
+ * 局限：4 字符/token 是英文经验值，对中文偏保守（实际约 1.5~2 字符/token），
+ *   宁可高估触发压缩，也不能低估撑爆窗口。
+ */
 export function estimateTokens(message: AgentMessage): number {
 	let chars = 0;
 
@@ -339,7 +374,15 @@ function findValidCutPoints(entries: Entry[], startIndex: number, endIndex: numb
 	return cutPoints;
 }
 
-/** Find the user-visible message that starts the turn containing an entry. */
+/** Find the user-visible message that starts the turn containing an entry.
+ *
+ * 中文注释：
+ * 职责：从给定条目向前回溯，找到其所属"回合"的起始条目下标。
+ * 回合起点定义：branch_summary 条目，或 user / bashExecution 消息
+ *   （用户可见输入即回合边界）。找不到返回 -1。
+ * 用途：压缩切点落在回合中间时（isSplitTurn），确定被拆分回合的起点，
+ *   以便把"回合前缀"与"保留尾部"分开摘要。
+ */
 export function findTurnStartIndex(entries: Entry[], entryIndex: number, startIndex: number): number {
 	for (let i = entryIndex; i >= startIndex; i--) {
 		const entry = entries[i];
@@ -366,7 +409,23 @@ export interface CutPointResult {
 	isSplitTurn: boolean;
 }
 
-/** Find the compaction cut point that keeps approximately the requested recent-token budget. */
+/** Find the compaction cut point that keeps approximately the requested recent-token budget.
+ *
+ * 中文注释：
+ * 职责：核心切点选择算法 —— 决定"历史从哪里一刀切开"。
+ * 核心逻辑：
+ *   ① findValidCutPoints 收集所有合法切点（user / assistant / 自定义等
+ *      可独立成段的条目；toolResult 不是合法切点 —— 切了会孤儿化其
+ *      所属的 toolCall）；
+ *   ② 从尾部往前累计 token，一旦达到 keepRecentTokens（默认 20000）预算，
+ *      在该位置之后找第一个合法切点 —— 即"保留最近约 2 万 token"；
+ *   ③ 回退微调：若切点前一格是 compaction / message 条目则再回退，
+ *      保证不会紧贴着摘要切（切点自身要落在完整段落边界上）；
+ *   ④ 若切点不是 user 消息，说明切在一个回合中间（isSplitTurn），
+ *      记录该回合起点 turnStartIndex 供上层做"回合前缀单独摘要"。
+ * 返回：CutPointResult { firstKeptEntryIndex（首个保留条目）；
+ *   turnStartIndex；isSplitTurn }。
+ */
 export function findCutPoint(
 	entries: Entry[],
 	startIndex: number,
@@ -521,7 +580,16 @@ export async function generateSummary(
 	return result.ok ? ok(result.value.text) : err(result.error);
 }
 
-/** Generate or update a conversation summary and return its provider usage. */
+/** Generate or update a conversation summary and return its provider usage.
+ *
+ * 中文注释：
+ * 职责：摘要请求的统一入口 —— 组装提示词并调用一次 LLM 完成请求。
+ * 核心逻辑：把对话序列化为文本包进 <conversation> 标签，若有上一版摘要
+ *   再包一层 <previous-summary>，加上结构化模板提示词（全量 / 增量二选一），
+ *   追加调用方的自定义指示；stopReason 为 aborted / error 时返回
+ *   CompactionError 而非抛异常（错误也是合法结果）。
+ * 调用关系：compactWithRequest 与 harness 的 summary 生成状态均调用。
+ */
 export function generateSummaryWithUsage(
 	currentMessages: AgentMessage[],
 	models: Models,
@@ -630,7 +698,27 @@ export interface CompactionPreparation {
 	settings: CompactionSettings;
 }
 
-/** Prepare session entries for compaction, or return undefined when compaction is not applicable. */
+/** Prepare session entries for compaction, or return undefined when compaction is not applicable.
+ *
+ * 中文注释：
+ * 职责：压缩的"准备阶段"（纯函数，不发起 LLM 请求）—— 把会话条目切成三段。
+ * 核心逻辑：
+ *   ① 幂等保护：路径为空或末尾已是 compaction 条目 → 无需压缩；
+ *   ② 增量衔接：若路径中已存在上一次压缩（prevCompactionIndex），把它的
+ *      retainedTail 还原成"虚拟条目"拼在其余条目前（摘要迭代更新时，
+ *      上次保留的尾部这次也要参与再压缩），并取出 previousSummary
+ *      供 LLM 做增量摘要；
+ *   ③ findCutPoint 选切点，把条目切为：
+ *      messagesToSummarize（将被摘要吞并的旧历史）
+ *      turnPrefixMessages（被拆分回合的前缀，单独摘要）
+ *      retainedTail（原样保留的近期消息，随 CompactionEntry 一起持久化）；
+ *   ④ extractFileOperations 提取被摘要历史的文件读写集合
+ *      （读过的文件 / 改过的文件），追加到摘要末尾，保证模型压缩后
+ *      仍知道"我碰过哪些文件"。
+ * 调用关系：harness 的 summary.deciding 状态调用本函数产生
+ *   DurableStructuralPreparation（先落盘再生成摘要，崩溃可恢复），
+ *   之后交给 compactWithRequest 发起真正的摘要请求。
+ */
 export function prepareCompaction(
 	pathEntries: Entry[],
 	settings: CompactionSettings,
@@ -723,7 +811,24 @@ Be concise. Focus on what's needed to understand the kept suffix.`;
 
 export { serializeConversation } from "./utils.ts";
 
-/** Generate compaction summary data from prepared session history. */
+/** Generate compaction summary data from prepared session history.
+ *
+ * 中文注释：
+ * 职责：压缩的"生成阶段" —— 用 LLM 产出结构化摘要（CompactResult）。
+ * 核心逻辑：
+ *   - 常规路径：一次 generateSummaryWithRequest（有 previousSummary 时
+ *     用 UPDATE 提示词做增量合并，否则全量摘要）；
+ *   - 拆分回合路径（isSplitTurn）：先摘要旧历史，再单独摘要回合前缀，
+ *     两段拼接（"Turn Context (split turn)"），usage 累加；
+ *   - maxTokens 上限取 reserveTokens 的 80%，防止摘要本身撑爆预算；
+ *   - 摘要格式是强约束的结构化模板：Goal / Constraints & Preferences /
+ *     Progress(Done/In Progress/Blocked) / Key Decisions / Next Steps /
+ *     Critical Context —— 保证下一个 LLM 能凭摘要无缝续接工作；
+ *   - 最后把文件操作清单（readFiles / modifiedFiles）格式化追加到摘要尾部，
+ *     并存入 details 供后续压缩继承。
+ * 返回：{ summary, tokensBefore, usage, retainedTail, details }，
+ *   由 harness 写成不可变的 CompactionEntry（替换旧历史 + 保留尾部）。
+ */
 export function compact(
 	preparation: CompactionPreparation,
 	models: Models,

@@ -78,6 +78,17 @@ export type AgentInitialState = Partial<
 	Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">
 >;
 
+/**
+ * 中文注释：
+ * 职责：创建 Agent 的可变内部状态（含防御性拷贝与访问器封装）。
+ * 核心逻辑：
+ *   - tools / messages 赋值时做浅拷贝（slice），防止外部数组被就地修改；
+ *   - systemPrompt 为只读计算属性：从 transcript 的 system 消息回放得到 ——
+ *     修改提示的方式是追加 system 消息而非直接赋值；
+ *   - 若初始 messages 不是 system 开头，则用 createInitialSystemMessage
+ *     构造首条 system 消息（携带初始提示词与工具声明），保证每个会话
+ *     都以 system 消息开头（provider 协议约定）。
+ */
 function createMutableAgentState(initialState?: AgentInitialState): MutableAgentState {
 	let tools = initialState?.tools?.slice() ?? [];
 	let messages = initialState?.messages?.slice() ?? [];
@@ -137,6 +148,13 @@ export interface AgentOptions {
 	toolExecution?: ToolExecutionMode;
 }
 
+/**
+ * 中文注释：
+ * 职责：待注入消息队列（steering / followUp 共用）。
+ * 核心逻辑：两种 drain 模式 ——
+ *   "all"：一次取空全部消息；"one-at-a-time"：每次只取最旧一条
+ *   （其余留到下一个注入点，保证一条 steering 消息独占一个回合）。
+ */
 class PendingMessageQueue {
 	private messages: AgentMessage[] = [];
 	public mode: QueueMode;
@@ -184,6 +202,27 @@ type ActiveRun = {
  *
  * `Agent` owns the current transcript, emits lifecycle events, executes tools,
  * and exposes queueing APIs for steering and follow-up messages.
+ *
+ * 中文注释：
+ * 职责：对底层 runAgentLoop 的"有状态"封装 —— pi 的轻量级 Agent 门面。
+ *
+ * 核心设计：
+ *   - 状态（_state）：transcript、工具表、模型、思考等级；systemPrompt 从
+ *     transcript 回放（写时追加 system 消息，而非直接改字段）；
+ *   - 单飞行模型（activeRun）：同一时刻只允许一个运行中的循环；
+ *     重入 prompt/continue 会抛错 —— 并发消息应走 steer()/followUp() 入队；
+ *   - 事件总线（listeners）：processEvents 先做内部状态归约（维护
+ *     streamingMessage / pendingToolCalls / errorMessage），再顺序 await
+ *     监听器；agent_end 的监听器结算完成后才算"空闲"（waitForIdle）；
+ *   - 两级队列：steeringQueue（当前回合工具执行完后插队注入，默认
+ *     one-at-a-time）与 followUpQueue（代理停止前唤醒，默认 one-at-a-time）；
+ *   - 失败兜底：循环抛错时 handleRunFailure 合成一条 stopReason 为
+ *     error/aborted 的 assistant 消息走完整事件序列，保证监听器总能
+ *     观察到结构完整的一次运行。
+ *
+ * 与 harness 的关系：Agent 是无持久化的轻量实现（内存态）；durable
+ *   会话由 @earendil-works/pi-agent-core 的 AgentHarness 承担（见
+ *   harness/ 目录），二者共享 types.ts 里的消息与工具契约。
  */
 export class Agent {
 	private _state: MutableAgentState;
@@ -457,6 +496,17 @@ export class Agent {
 		};
 	}
 
+	/**
+	 * 中文注释：
+	 * 职责：组装传给底层循环的 AgentLoopConfig —— 把 Agent 实例上的
+	 * 可变配置（模型 / 钩子 / 队列读取器）打包成一份快照。
+	 * 核心逻辑：
+	 *   - thinkingLevel === "off" 映射为 undefined（不发送 reasoning 参数）；
+	 *   - getSteeringMessages / getFollowUpMessages 把队列 drain 接到循环的
+	 *     轮询点上；skipInitialSteeringPoll 用于 continue() 场景——steering
+	 *     消息刚被取走，避免同批消息重复注入；
+	 *   - shouldStopAfterTurn / prepareNextTurn 钩子注入当前运行的 signal。
+	 */
 	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
 		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
 		const shouldStopAfterTurn = this.shouldStopAfterTurn;
@@ -498,6 +548,15 @@ export class Agent {
 		};
 	}
 
+	/**
+	 * 中文注释：
+	 * 职责：运行生命周期管理 —— 保证任意时刻只有一个活跃运行（activeRun）。
+	 * 核心逻辑：创建 AbortController 与对外可 await 的 promise →
+	 *   标记 isStreaming、清空上次错误 → 执行 executor（真正的循环）→
+	 *   异常走 handleRunFailure 合成失败消息 → finally 调 finishRun
+	 *   （复位运行时状态并 resolve promise，唤醒 waitForIdle 的等待者）。
+	 * 参数：executor 接收本次运行的 signal，负责把 signal 传给 LLM 请求与工具。
+	 */
 	private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing.");
@@ -555,6 +614,17 @@ export class Agent {
 	 * `agent_end` only means no further loop events will be emitted. The run is
 	 * considered idle later, after all awaited listeners for `agent_end` finish
 	 * and `finishRun()` clears runtime-owned state.
+	 */
+	/**
+	 * 中文注释：
+	 * 职责：事件归约器 —— 消费循环事件维护 Agent 内部状态，再广播给监听器。
+	 * 核心逻辑：
+	 *   message_start/update → 记录 streamingMessage（当前流式消息）；
+	 *   message_end → 清空 streamingMessage 并把最终消息 push 进 transcript；
+	 *   tool_execution_start/end → 维护 pendingToolCalls 集合（正在执行的工具调用 id）；
+	 *   turn_end → assistant 消息带 errorMessage 时记录到 state.errorMessage；
+	 *   归约完成后按订阅顺序逐个 await 监听器（监听器可持久化 / 渲染 UI，
+	 *   其耗时计入本次运行的结算窗口）。
 	 */
 	private async processEvents(event: AgentEvent): Promise<void> {
 		switch (event.type) {

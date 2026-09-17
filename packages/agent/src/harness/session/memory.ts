@@ -34,6 +34,21 @@ export interface MemorySessionRepoOptions {
 	now?: () => number;
 }
 
+/**
+ * 中文注释：
+ * 职责：Storage 接口的"内存版"实现（对话树 / 值 / 列表的进程内持久化）。
+ * 定位：与 JSONL、SQLite 后端实现同一 Storage 契约，用于测试、临时会话
+ *   与 conformance 基准 —— 上层（Session / harness）对后端完全无感知。
+ * 核心逻辑：
+ *   - commit：所有写操作先经 commitQueue 串行化（promise 链），再交给
+ *     InMemoryStorageState 做校验（prepareCommit：序号分配、父存在性等）
+ *     与原子应用（applyValidated），返回含会话统计的 CommitResult ——
+ *     串行队列保证并发 commit 不会交错；
+ *   - 各查询方法（getEntries / getValue / scan* / readList）直接同步转发；
+ *   - fork：在源提交边界之间拷贝一份新的 MemoryStorage（分支 / 会话分叉）；
+ *   - close：幂等，等待 commitQueue 排空后进入 closed 状态。
+ * 参数：options.now 可注入时钟（测试可控时间）。
+ */
 export class MemoryStorage implements Storage {
 	private readonly now: () => number;
 	private storageState = new InMemoryStorageState();
@@ -142,6 +157,18 @@ interface MemorySessionRecord {
 	open: boolean;
 }
 
+/**
+ * 中文注释：
+ * 职责：Session 的进程内门面 —— 在 MemorySessionRepo 与底层
+ *   StorageBackedSession 之间管理"打开 / 关闭"生命周期。
+ * 核心逻辑：
+ *   - admit()：所有公开方法经过准入包装 —— 把进行中的 promise 登记进
+ *     admitted 集合，close() 等待该集合全部结算后才真正关闭（不会切断
+ *     进行中的读写）；
+ *   - beginMutation / mutate：互斥变更通道（一次至多一个 commit），闭包
+ *     拿到的是无 end 权限的 SessionMutator；
+ *   - 关闭后再调用任何方法统一拒绝（closedError）。
+ */
 class MemorySessionFacade implements Session {
 	readonly metadata: SessionMetadata;
 	readonly idGenerator: IdGenerator;
@@ -331,6 +358,17 @@ class MemorySessionFacade implements Session {
 	}
 }
 
+/**
+ * 中文注释：
+ * 职责：内存会话仓库 —— 管理多个 MemoryStorage 会话的仓库级生命周期。
+ * 核心逻辑：
+ *   - create：铸造 UUIDv7 会话 id（pendingIds 防并发重号）→ 建存储与
+ *     StorageBackedSession → 登记 open 状态；
+ *   - open：把已关闭的会话重新打开（同一 id 不允许双开）；
+ *   - fork：复用源会话存储的 fork（在提交边界间拷贝），新会话带
+ *     parentSessionId 溯源；
+ *   - delete / close：删除需先关闭；close 幂等并等待全部会话关闭。
+ */
 export class MemorySessionRepo implements SessionRepo {
 	private readonly now: () => number;
 	private readonly sessions = new Map<string, MemorySessionRecord>();

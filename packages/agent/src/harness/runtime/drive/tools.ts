@@ -652,7 +652,34 @@ async function runParallel<TContext extends object | undefined>(
 	return { kind: "continue" };
 }
 
-/** Execute, recover, stage, and source-order one complete durable tool batch. */
+/** Execute, recover, stage, and source-order one complete durable tool batch.
+ *
+ * 中文注释：
+ * 职责：harness 层"工具阶段"的持久化执行总入口（run 操作进入
+ *   OperationState.at === "tools" 时由 driveOperation 调用）。
+ *
+ * 与轻量循环（agent-loop.ts）的本质区别 —— 每一步都先落盘再执行：
+ *   ① 恢复判定：批内存在 effect_pending / outcome_ready 调用 → 这是崩溃
+ *      恢复路径，先补发 turn_start(recovery) 事件；
+ *   ② readToolBatchSource + materializeReady：读出 assistant 源消息并把
+ *      已就绪结果按源顺序物化成 entry；
+ *   ③ 已请求取消 → 走串行分支，为每个未完成调用合成"取消 / 中断"结果；
+ *   ④ 正常路径：按 LaneConfiguration.activeToolNames 过滤出本批可用工具，
+ *      解析 toolContext，按 settings.toolExecution 分派：
+ *      - runSequential：逐个调用（有界转移次数防死循环），结果即时物化；
+ *      - runParallel：全部并发执行，完成一个物化一个（流水线）。
+ *
+ * 单个调用的两阶段提交（intent / settlement 模式，harness.md §0.3 规则 4）：
+ *   planned →（publishToolIntent：参数与 replay 策略落盘）→ effect_pending
+ *   →（真实执行 performToolInvocation，期间可写进度检查点）→
+ *   （publishToolOutcome：完整结果进 pendingEntry + 状态推进）→
+ *   outcome_ready →（materializeReady：按源顺序插入会话树）→ completed。
+ *
+ * 崩溃恢复策略（recoverToolInvocation）：
+ *   - replay === "safe"（读类工具）：用持久化的参数重放执行；
+ *   - replay === "never"（写类工具）：绝不重放 —— 用最后检查点 + 明确的
+ *     中断警告合成结果（外部效果可能已发生也可能没有，如实告知模型）。
+ */
 export async function runTools<TContext extends object | undefined>(
 	lane: Lane<TContext>,
 	drive: Drive,

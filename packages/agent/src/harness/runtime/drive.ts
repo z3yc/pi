@@ -25,7 +25,24 @@ function currentOperation<TContext extends object | undefined>(lane: Lane<TConte
 	return operation;
 }
 
-/** Drive one installed pass through direct durable procedures until settlement or a durable wait. */
+/** Drive one installed pass through direct durable procedures until settlement or a durable wait.
+ *
+ * 中文注释：
+ * 职责：操作状态机的"驱动器" —— harness 运行时的中央调度循环。
+ * 核心逻辑：
+ *   ① 校验 drive 的 operationId 与通道当前操作一致（不一致即会话不变量错误）；
+ *   ② control.status 为 running 时先跑 before_drive 钩子（AbortRequested
+ *      会被转成取消流程而不是异常）；
+ *   ③ for(;;) 大循环：每次读取持久化的 operationState，按 at 字段分派到
+ *      13 个过程函数之一（startRun / runGeneration / runTools / runDeferred /
+ *      runStructural* / commitNavigation / reconcileOperation）；
+ *      过程返回 settled（终态）/ waiting（重试等待或延迟挂起，交还调用方）
+ *      / continue（状态已推进，读新状态再来一轮）；
+ *   ④ 前进性保护：状态没变化且未在取消中 → SessionInvariantError
+ *      （状态机不允许空转，防止静默死循环）。
+ * 设计要点：drive 与"谁调用它"解耦 —— 进程内由 lane 的便捷方法驱动，
+ *   也可由外部调度器（alarm / job）反复驱动同一操作直到终结。
+ */
 export async function driveOperation<TContext extends object | undefined>(
 	lane: Lane<TContext>,
 	drive: Drive,

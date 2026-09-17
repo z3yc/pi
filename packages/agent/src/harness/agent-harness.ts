@@ -535,6 +535,20 @@ export interface AgentHarnessOptions<TContext extends object | undefined = objec
 	entryProjectors?: Record<string, EntryProjector>;
 }
 
+/**
+ * 中文注释：
+ * 职责：AgentLane —— 挂在会话某条 Branch 上的"可运行通道"公共接口。
+ * 一个 lane = 命名分支 + 总配置（模型/思考等级/激活工具）+ 收件箱
+ *   + 至多一个进行中的操作（operation）。
+ * 四个原语（harness.md §0.2）：
+ *   accept —— 持久化地受理一个操作（run / compaction / navigation），
+ *     只写元数据与起始状态，不启动任何效果；
+ *   drive —— 推进一个已受理的操作直到终结或持久等待（重试 / 延迟）；
+ *   requestAbort —— 持久化地请求取消；
+ *   inspectExecution —— 原子读取当前与最近终结的执行信息。
+ * 其余方法（prompt / resume / abort / steer / followUp / compact /
+ *   navigateTree …）都是四原语 + 进程内等待策略的组合便捷层。
+ */
 export interface AgentLane {
 	readonly name: string;
 	getTipId(context: Context): Promise<string | null>;
@@ -583,6 +597,18 @@ export interface AcquireLaneOptions {
 	createAt?: string | null;
 }
 
+/**
+ * 中文注释：
+ * 职责：AgentHarness —— 绑定一个已打开 Session 的持久化运行时入口。
+ * 管理三类全局资源：harness 级工具与资源注册表（tools / resources）、
+ *   钩子（hooks：before_run / before_tool / after_tool / before_compaction
+ *   等 12 个拦截点）、被动事件（events：按类型订阅 HarnessEvent）；
+ *   以及运行时配置（streamOptions / retry / compaction / 队列模式）。
+ * lane(name) 获取或创建通道；每个通道独立驱动，共享同一棵会话树
+ *   （并行 lane 互不协调，见 harness.md §0.4）。
+ * create 返回 { harness, open }：open 是重启时发现的未终结操作清单，
+ *   由宿主决定何时逐个 drive 恢复。
+ */
 export interface AgentHarness<TContext extends object | undefined = object | undefined> {
 	lane(name: string, context: Context): Promise<AgentLane>;
 	lane(name: string, options: AcquireLaneOptions, context: Context): Promise<AgentLane>;

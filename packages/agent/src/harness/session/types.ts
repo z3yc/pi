@@ -13,6 +13,9 @@ export type SettledAssistantMessage = AssistantMessage & {
 	stopReason: Exclude<StopReason, "pending">;
 };
 
+/** 中文注释：会话树条目类型 —— 持久层的四类不可变记录（写一次、只追加）：
+ * message（对话消息）、compaction（压缩边界：summary + retainedTail）、
+ * branch_summary（分支切换摘要）、custom（应用自定义数据）。 */
 export type EntryType = "message" | "compaction" | "branch_summary" | "custom";
 
 export interface EntryBase {
@@ -312,7 +315,24 @@ export interface NavigationReadyToCommitOperation extends OperationScope {
 	label?: string;
 }
 
-/** Flat durable operation state: exactly 13 family-neutral dispatcher leaves. */
+/** Flat durable operation state: exactly 13 family-neutral dispatcher leaves.
+ *
+ * 中文注释（操作状态机总览 —— 持久化记忆与工具调用的"进度条"）：
+ * OperationState 是写进 pi.op.state 的全量重启点：每个状态都携带
+ * control（取消控制）、settings（运行配置）、latestAssistantEntryId
+ * 等完整现场，崩溃后读它即可续跑。
+ * 13 个叶子按操作种类分三族：
+ *   run 族 —— starting（刚受理）→ checkpoint（回合边界，判断是否需要
+ *     压缩 / 是否继续）→ assistant.ready（可发起生成）→
+ *     assistant.effect_pending（意图已落盘，响应未决 —— 唯一真正不确定
+ *     的窗口）→ assistant.retry_wait（退避重试）→ tools（工具批次）→
+ *     deferred.*（外部延迟句柄挂起）；
+ *   summary 族 —— summary.deciding（决定是否摘要）→ ready →
+ *     effect_pending → retry_wait（压缩与分支摘要的生成状态）；
+ *   navigation 族 —— navigation.ready_to_commit（树回退 / 跳转待提交）。
+ * 转移规则：每个过程完成后用 operationScopeOf 复制公共作用域构造后继
+ *   叶子，整体替换（而非增量打补丁），driveOperation 按 at 分派。
+ */
 export type OperationState =
 	| StartingOperation
 	| CheckpointOperation

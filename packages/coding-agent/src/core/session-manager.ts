@@ -322,6 +322,11 @@ export function parseSessionEntries(content: string): FileEntry[] {
 	return entries;
 }
 
+/**
+ * 中文注释：
+ * 职责：取条目列表中最后一条压缩条目（无则 null）。
+ * 用途：判断当前分支是否已被压缩过、读取上一次摘要做增量更新。
+ */
 export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEntry | null {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		if (entries[i].type === "compaction") {
@@ -340,6 +345,16 @@ function buildEntryIndex(entries: SessionEntry[], byId?: Map<string, SessionEntr
 	return index;
 }
 
+/**
+ * 中文注释：
+ * 职责：从叶子条目回溯到根，构造当前分支的线性路径（记忆恢复的第一步）。
+ * 核心逻辑：先建 id → entry 索引；leafId 为 null 返回空；未指定 leafId 时
+ *   取文件中最后一条条目（默认叶子）；然后沿 parentId 逐级向上回溯收集，
+ *   反转后得到从根到叶的有序数组。树形存储（分支 / 分叉 / 回退）由此
+ *   降维成一条可发送给 LLM 的线性历史。
+ * 调用关系：buildSessionContext / buildContextEntries / getSessionContextSettings
+ *   均基于本函数的输出工作。
+ */
 function buildSessionPath(
 	entries: SessionEntry[],
 	leafId?: string | null,
@@ -388,6 +403,19 @@ function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "
 /**
  * Project one selected session entry into LLM/runtime messages.
  * Plain custom entries are display/state entries and do not participate in context.
+ *
+ * 中文注释：
+ * 职责：条目 → 消息的投影器（单个条目转换为 0~n 条上下文消息）。
+ * 核心逻辑（按条目类型分派）：
+ *   message        → 原样透传（对 null content 做兼容修补：旧版/手工编辑
+ *                     的会话文件可能缺字段，system 补 ""、其余补 []）；
+ *   custom_message → 转成 CustomMessage（参与 LLM 上下文的扩展注入）；
+ *   branch_summary → 转成 branchSummary 消息（分支切换时的衔接摘要）；
+ *   compaction     → 转成 compactionSummary 消息（必要时先带出压缩边界
+ *                     的完整 systemMessage —— 恢复当时的提示词与工具声明）；
+ *   其余（label / session_info / 普通 custom 等）→ []（纯元数据不进上下文）。
+ * 调用关系：buildSessionContext 对 buildContextEntries 的每个条目调用本函数
+ *   并 flatMap 展平。
  */
 export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage[] {
 	if (entry.type === "message") {
@@ -425,6 +453,20 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
  * the latest compaction is represented by the compaction entry itself, followed
  * by the kept entries starting at firstKeptEntryId and all entries after the
  * compaction entry. Older summarized entries are omitted.
+ *
+ * 中文注释：
+ * 职责：构造"压缩感知"的活动条目列表 —— pi 记忆重建的核心。
+ * 核心逻辑：
+ *   ① buildSessionPath 取当前叶子路径（线性历史）；
+ *   ② 找路径上最后一次压缩条目；没有则整条路径即上下文；
+ *   ③ 有压缩时输出 = [压缩条目（其 summary 将以摘要消息形式存在）]
+ *      + [firstKeptEntryId 起的保留尾部（跳过其中的 system 消息）]
+ *      + [压缩之后新增的全部条目]；
+ *      被摘要吞并的更早条目直接省略 —— 这就是"压缩改变上下文而不改存储"：
+ *      原始历史仍在文件里（不可变），只是不再进入 LLM 窗口。
+ * 调用关系：SessionManager.buildContextEntries 的模块级实现，
+ *   agent harness 的 compaction 也复用同一算法（见 packages/agent
+ *   src/harness/session/context.ts）。
  */
 export function buildContextEntries(
 	entries: SessionEntry[],
@@ -468,6 +510,18 @@ export function buildContextEntries(
  * Build the session context from entries using tree traversal.
  * If leafId is provided, walks from that entry to root.
  * Handles compaction and branch summaries along the path.
+ *
+ * 中文注释：
+ * 职责：记忆恢复总入口 —— 从会话条目重建 LLM 可用的完整上下文。
+ * 核心逻辑（三步管线）：
+ *   ① buildSessionPath：树 → 线性路径（沿 parentId 从叶子回溯到根）；
+ *   ② getSessionContextSettings：扫路径恢复"最后生效"的思考等级与模型
+ *      （model_change / thinking_level_change 条目按序覆盖；assistant 消息
+ *      自身的 provider/model 也作为恢复来源）；
+ *   ③ buildContextEntries + sessionEntryToContextMessages：压缩感知的条目
+ *      过滤 + 逐条投影成消息数组。
+ * 调用关系：coding-agent 启动 / 切换会话 / 回退分支时调用，产物直接
+ *   作为 Agent 的 initialState 恢复对话；harness 恢复运行时亦走相同逻辑。
  */
 export function buildSessionContext(
 	entries: SessionEntry[],
